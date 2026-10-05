@@ -2,7 +2,7 @@
   <div class="crisis">
     <div class="toolbar">
       <button class="add" @click="showForm=!showForm">＋ 新建危机事件</button>
-      <span class="loop-hint">🔗 红/橙预警按「话题 + 时间窗口」归并：多规则并发触发可承接同一事件并上调级别；解除幂等、结案可回滚；可拆分跨角色协同工单，结案须先完结全部工单</span>
+      <span class="loop-hint">🔗 红/橙预警按「话题 + 时间窗口」归并：多规则并发触发可承接同一事件并上调级别；统一结案守卫核验工单/声明/外部协作/复盘审核，结案联动解除预警、收口通知回执，解除幂等、结案可回滚；可拆分跨角色协同工单</span>
     </div>
 
     <form v-if="showForm" class="c-form" @submit.prevent="create">
@@ -127,6 +127,7 @@
               <span v-if="cl.report_id || (review.report && review.report.published_version)" class="cl-report">
                 📝 复盘报告已回写：{{ cl.report_title || review.report?.title }}（v{{ cl.report_version || review.report?.published_version }}）
               </span>
+              <span v-if="settledCount(cl)" class="cl-notify">🔔 收口通知 {{ settledCount(cl) }} 个（回滚时恢复）</span>
               <em>{{ cl.closed_at }}<template v-if="cl.rolled_back"> · 回滚于 {{ cl.rolled_back_at }}{{ cl.rollback_note ? '：' + cl.rollback_note : '' }}</template></em>
             </div>
           </div>
@@ -138,11 +139,34 @@
             <button class="mini-link" @click="gotoReport(c)">前往报告 →</button>
           </div>
 
+          <!-- 统一结案状态守卫：阻塞项 / 联动收口项 / 提示 -->
+          <div v-if="c.status!=='closed' && review.readiness" class="rv-guard">
+            <h6>🔒 结案就绪清单</h6>
+            <div v-if="review.readiness.blocks.length" class="guard-blocks">
+              <div v-for="b in review.readiness.blocks" :key="b.key" class="guard-item block">
+                <span class="g-ico">⛔</span>
+                <span class="g-text">{{ b.text }}</span>
+                <button class="g-link" @click="gotoGuard(b, c)">去处理 →</button>
+              </div>
+            </div>
+            <div v-else class="guard-ok">✅ 状态守卫已通过：工单、声明、外部协作、复盘审核均已闭环，可以结案</div>
+            <div v-for="a in review.readiness.actions" :key="a.key" class="guard-item action">
+              <span class="g-ico">🔗</span>
+              <span class="g-text">{{ a.text }}</span>
+            </div>
+            <div v-for="n in review.readiness.notice" :key="n.key" class="guard-item notice">
+              <span class="g-ico">ℹ️</span>
+              <span class="g-text">{{ n.text }}</span>
+              <button class="g-link" @click="gotoReport(c)">前往报告 →</button>
+            </div>
+          </div>
+
           <div v-if="c.status!=='closed'" class="close-box">
             <textarea v-model="closeSummary" placeholder="结案回溯总结：处置结果、舆情回落情况、经验沉淀…"></textarea>
             <div class="close-row">
-              <span v-if="review.stats.open" class="cascade">结案将同步解除 {{ review.stats.open }} 条未解除预警</span>
-              <button class="close" @click="confirmClose(c)">✔ 确认结案</button>
+              <button v-if="review.readiness && review.readiness.blocks.length" class="close" disabled
+                title="存在未闭环事项，请先按结案就绪清单处理">⛔ {{ review.readiness.blocks.length }} 项未闭环</button>
+              <button v-else class="close" @click="confirmClose(c)">✔ 确认结案</button>
             </div>
           </div>
           <div v-else class="closed-tip">✅ 已结案 · 回溯只读</div>
@@ -199,12 +223,35 @@ function defaultSummary(c) {
   return `「${c.title}」处置完毕，舆情热度回落至常态区间，未出现次生舆情，完成闭环。`
 }
 async function confirmClose(c) {
-  if (!confirm(`确定结案「${c.title}」？`)) return
+  const ready = review.value?.readiness
+  if (ready && ready.blocks.length) {
+    store.msg(ready.blocks[0].text, 'warn') // 统一状态守卫：阻塞项未清零时前端拦截
+    return
+  }
+  const autoBits = (ready?.actions || []).map((a) => `${a.label} ${a.count}`)
+  const tip = autoBits.length ? `（将自动联动：${autoBits.join('、')}）` : ''
+  if (!confirm(`确定结案「${c.title}」？${tip}`)) return
   try {
     await store.closeCrisis(c.id, closeSummary.value)
     reviewId.value = null
     review.value = null
-  } catch (e) { store.msg(e.message, 'warn') } // 结案守卫：未完结工单拦截
+  } catch (e) {
+    // 并发兜底：服务端统一守卫返回 blocks 时展示第一条阻塞原因
+    const msg = e.blocks?.[0]?.text || e.message
+    store.msg(msg, 'warn')
+    if (reviewId.value === c.id) review.value = await store.fetchCrisisReview(c.id)
+  }
+}
+// 结案档案中归档的通知收口数量（历史档案无该列时按 0 处理）
+function settledCount(cl) {
+  try { return (JSON.parse(cl.settled_notify || '[]') || []).length } catch { return 0 }
+}
+// 结案守卫阻塞项 → 跳转对应模块处理
+function gotoGuard(b, c) {
+  if (b.key === 'workorder') gotoWorkOrder(c)
+  else if (b.key === 'statement') gotoStmt(c)
+  else if (b.key === 'ext') gotoExt(c)
+  else if (b.key === 'report') gotoReport(c)
 }
 // 跳转传播路径页并按该危机过滤
 function gotoProp(c) {
@@ -378,6 +425,20 @@ h5{margin:0 0 8px;color:#ffd54f;font-size:12px;}
 .rv-report{display:flex;align-items:center;gap:8px;font-size:11px;color:#dbe4f3;background:#13233f;border-radius:7px;padding:7px 11px;margin-bottom:10px;border-left:3px solid #7e57c2;flex-wrap:wrap;}
 .rv-report.published{border-left-color:#66bb6a;}.rv-report.reviewing{border-left-color:#ffa726;}
 .mini-link{margin-left:auto;background:none;border:none;color:#90caf9;font-size:11px;cursor:pointer;text-decoration:underline;}
+/* 统一结案状态守卫清单 */
+.rv-guard{background:#0d2137;border:1px solid rgba(144,202,249,.22);border-radius:8px;padding:9px 11px;margin-bottom:10px;}
+.rv-guard h6{margin:0 0 7px;color:#ffd54f;font-size:11px;font-weight:600;}
+.guard-blocks{display:flex;flex-direction:column;gap:5px;margin-bottom:6px;}
+.guard-item{display:flex;align-items:center;gap:8px;font-size:11px;padding:5px 9px;border-radius:6px;background:#13233f;flex-wrap:wrap;}
+.guard-item.block{color:#ef9a9a;border:1px solid rgba(239,83,80,.35);background:#2a1418;}
+.guard-item.action{color:#90caf9;border:1px solid rgba(66,165,245,.25);background:#0e2238;}
+.guard-item.notice{color:#ffe082;border:1px solid rgba(255,224,130,.25);background:#2c260f;}
+.g-ico{flex:none;}
+.g-text{flex:1;min-width:180px;}
+.g-link{margin-left:auto;background:#0d2137;border:1px solid rgba(120,160,220,.3);color:#90caf9;border-radius:5px;padding:2px 9px;font-size:10px;cursor:pointer;white-space:nowrap;}
+.g-link:hover{background:#17345c;}
+.guard-ok{font-size:11px;color:#a5d6a7;background:#12261a;border:1px solid rgba(102,187,106,.35);border-radius:6px;padding:6px 9px;margin-bottom:6px;}
+.cl-notify{font-size:10px;color:#80cbc4;background:#0c2622;border:1px solid rgba(38,166,154,.35);border-radius:5px;padding:2px 8px;align-self:flex-start;}
 .rv-none{color:#5b6f94;font-size:11px;text-align:center;padding:8px 0;}
 .close-box{border-top:1px dashed rgba(120,160,220,0.15);padding-top:10px;display:flex;flex-direction:column;gap:8px;}
 .close-box textarea{min-height:56px;}
@@ -390,6 +451,7 @@ h5{margin:0 0 8px;color:#ffd54f;font-size:12px;}
 .stmt-btn{background:linear-gradient(135deg,#00838f,#006064);border:none;color:#fff;font-weight:600;cursor:pointer;}
 .report-btn{background:linear-gradient(135deg,#7b1fa2,#4a148c);border:none;color:#fff;font-weight:600;cursor:pointer;}
 .close{background:linear-gradient(135deg,#2e7d32,#1b5e20);border:none;color:#fff;font-weight:600;cursor:pointer;}
+.close:disabled{background:#3a4456;color:#90a4ae;cursor:not-allowed;font-weight:400;opacity:.85;}
 .reopen{background:linear-gradient(135deg,#f9a825,#f57f17);border:none;color:#fff;font-weight:600;cursor:pointer;}
 .none{color:#5b6f94;text-align:center;padding:40px;}
 </style>

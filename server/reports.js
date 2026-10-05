@@ -352,12 +352,12 @@ export function approveReport(id, body, actor) {
     JSON.stringify(snap), ts, 'published', actor.user, ts, ts, ts, id)
   const version = archiveVersion({ id }, 'publish', note, actor)
   run('UPDATE crisis_reports SET published_version=? WHERE id=?', version, id)
-  // 回写最近一次结案档案（报告状态进入统计口径；该危机后续重开结案时此标记随档案回滚撤销）
-  const closure = q1('SELECT * FROM crisis_closures WHERE crisis_id=? ORDER BY id DESC LIMIT 1', r.crisis_id)
+  // 回写最近一次有效（未回滚）结案档案（报告状态进入统计口径；已回滚档案不再被回写）
+  const closure = q1('SELECT * FROM crisis_closures WHERE crisis_id=? AND rolled_back=0 ORDER BY id DESC LIMIT 1', r.crisis_id)
   if (closure) run('UPDATE crisis_closures SET report_id=?, report_version=?, report_title=? WHERE id=?', id, version, r.title, closure.id)
   addLog(id, 'approve', `审核通过并发布（归档 v${version}，审核人：${actor.user}）${note ? '：' + note : ''}`, actor)
   addTimeline(r.crisis_id, '复盘发布',
-    `复盘报告「${r.title}」审核通过并发布（v${version}），已回写结案档案` + (closure ? '' : '（该事件暂无结案档案，暂仅更新统计口径）'), ts)
+    `复盘报告「${r.title}」审核通过并发布（v${version}）` + (closure ? '，已回写结案档案' : '（该事件暂无有效结案档案，暂仅更新统计口径）'), ts)
   return { ok: true, version, closureId: closure ? closure.id : null }
 }
 

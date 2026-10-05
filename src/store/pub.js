@@ -11,7 +11,7 @@ async function api(path, method = 'GET', body, qs, extraHeaders) {
   if (body) opt.body = JSON.stringify(body)
   const r = await fetch(url, opt)
   const data = await r.json()
-  if (!r.ok) throw Object.assign(new Error(data.error || '请求失败'), { details: data.details })
+  if (!r.ok) throw Object.assign(new Error(data.error || '请求失败'), { details: data.details, blocks: data.blocks })
   return data
 }
 
@@ -104,18 +104,30 @@ export const usePubStore = defineStore('pub', {
     async setCrisisStatus(id, st) { await api(`/crisis/${id}/status`, 'POST', st); await this.load() },
     async addCrisisTimeline(id, t) { await api(`/crisis/${id}/timeline`, 'POST', t); await this.load() },
     async fetchCrisisReview(id) { return await api(`/crisis/${id}/review`) },
+    async fetchClosureReadiness(id) { return await api(`/crisis/${id}/closure-readiness`) },
     async closeCrisis(id, summary) {
       const r = await api(`/crisis/${id}/close`, 'POST', { summary })
       await this.load()
       if (r.already) this.msg('事件已处于结案状态', 'info')
-      else this.msg(r.resolved ? `事件已结案，同步解除 ${r.resolved} 条预警` : '事件已结案', 'success')
+      else {
+        const bits = ['事件已结案']
+        if (r.resolved) bits.push(`同步解除 ${r.resolved} 条预警`)
+        if (r.settledNotify) bits.push(`收口 ${r.settledNotify} 个未闭环通知`)
+        this.msg(bits.join('，'), 'success')
+      }
       return r
     },
     async reopenCrisis(id, note) {
       const r = await api(`/crisis/${id}/reopen`, 'POST', { note })
       await this.load()
       if (r.already) this.msg('事件未在结案状态，无需回滚', 'info')
-      else this.msg(r.restored ? `已回滚结案，恢复 ${r.restored} 条未解除预警` : '已回滚结案，事件重新打开', 'success')
+      else {
+        const bits = ['已回滚结案']
+        if (r.restored) bits.push(`恢复 ${r.restored} 条未解除预警`)
+        if (r.restoredNotify) bits.push(`恢复 ${r.restoredNotify} 个通知为结案前状态`)
+        if (r.staleClosed) bits.push(`撤销 ${r.staleClosed} 个结案通报`)
+        this.msg(bits.length > 1 ? bits.join('，') : '事件重新打开', 'success')
+      }
       return r
     },
     async delCrisis(id) { await api('/crisis/' + id, 'DELETE'); await this.load() },

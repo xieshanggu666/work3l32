@@ -90,12 +90,13 @@ CREATE TABLE IF NOT EXISTS crisis_timeline (
   ref_type TEXT NOT NULL DEFAULT '',  -- 链路锚点：workorder/notify（空=普通处置记录）
   ref_id INTEGER                       -- 锚点对象 id（工单 id 等，看板/复盘可跳转）
 );
--- 结案档案：每次结案一行，记录联动解除的预警清单与结案前状态，支撑结案回滚精确恢复
+-- 结案档案：每次结案一行，记录联动解除的预警清单、通知收口清单与结案前状态，支撑结案回滚精确恢复
 CREATE TABLE IF NOT EXISTS crisis_closures (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   crisis_id INTEGER NOT NULL,
   summary TEXT NOT NULL DEFAULT '',
   resolved_events TEXT NOT NULL DEFAULT '[]',  -- 结案联动解除的 alert_event id 列表（JSON）
+  settled_notify TEXT NOT NULL DEFAULT '[]',   -- 结案统一收口的通知任务及结案前状态（JSON，回滚恢复用）
   prev_status TEXT NOT NULL DEFAULT 'disposal', -- 结案前状态（回滚恢复目标）
   closed_at TEXT NOT NULL,
   rolled_back INTEGER NOT NULL DEFAULT 0,
@@ -602,6 +603,9 @@ ensureColumn('prop_paths', 'last_outbreak_wo_at', 'last_outbreak_wo_at INTEGER')
 ensureColumn('crisis_closures', 'report_id', 'report_id INTEGER')
 ensureColumn('crisis_closures', 'report_version', 'report_version INTEGER NOT NULL DEFAULT 0')
 ensureColumn('crisis_closures', 'report_title', "report_title TEXT NOT NULL DEFAULT ''")
+// 结案统一收口的通知任务清单（JSON：[{id,prev,work_order_id,title}]），回滚结案时按结案前状态精确恢复；
+// 历史结案档案该列为空/NULL，回滚仅恢复事件状态与预警（与旧口径一致）
+ensureColumn('crisis_closures', 'settled_notify', "settled_notify TEXT NOT NULL DEFAULT '[]'")
 // 危机声明关联（工单卡片展示最近一次声明回写的进度）
 ensureColumn('work_orders', 'last_statement_id', 'last_statement_id INTEGER')
 // ===== 协同调度链路升级：工单与通知共享可追踪状态流 =====
