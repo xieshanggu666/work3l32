@@ -349,6 +349,17 @@ function attemptSend(t) {
 // 回执超时升级：原任务标记已升级，向升级渠道生成【升级】任务（升级任务不再二次升级），并写危机时间线
 function escalateTask(t) {
   const ts = now()
+  // 结案安全守卫：危机结案时在途通知已统一中止；此处兜底处理遗漏/竞态（如结案事务与调度并发）的待回执任务——
+  // 已结案事件不再催办、不生成升级任务，直接按结案口径中止，保证结案档案稳定。
+  const crisisRef = resolveTaskSources(t).crisisId
+  if (crisisRef) {
+    const cc = q1('SELECT status FROM crisis WHERE id=?', crisisRef)
+    if (cc && cc.status === 'closed') {
+      const r = run(`UPDATE notify_tasks SET status='cancelled', updated=? WHERE id=? AND status='sent'`, ts, t.id)
+      if (Number(r.changes)) addLog(t.id, 'cancelled', '关联危机已结案，待回执通知按结案口径中止，不再超时升级', '系统')
+      return
+    }
+  }
   db.exec('BEGIN')
   try {
     const r = run(`UPDATE notify_tasks SET escalated=1, status='escalated', updated=? WHERE id=? AND escalated=0 AND status='sent'`, ts, t.id)

@@ -122,11 +122,14 @@ export function buildSnapshot(crisisId) {
     }))
   }
 
-  // ---- 结案档案（含回滚记录） ----
+  // ---- 结案档案（含回滚记录与统一守卫快照/通知中止清单） ----
   const closures = q('SELECT * FROM crisis_closures WHERE crisis_id=? ORDER BY id ASC', crisisId).map((cl) => ({
     id: cl.id, summary: cl.summary, closed_at: cl.closed_at, rolled_back: cl.rolled_back,
     rolled_back_at: cl.rolled_back_at, rollback_note: cl.rollback_note,
-    report_id: cl.report_id, report_version: cl.report_version, report_title: cl.report_title
+    report_id: cl.report_id, report_version: cl.report_version, report_title: cl.report_title,
+    resolved_events: safeParse(cl.resolved_events, []),
+    cancelled_tasks: safeParse(cl.cancelled_tasks, []),
+    guard_snapshot: safeParse(cl.guard_snapshot, null)
   }))
 
   // ---- 危机声明：公关起草→法务审核→分渠道发布登记（含分渠道结果与回写口径） ----
@@ -352,12 +355,15 @@ export function approveReport(id, body, actor) {
     JSON.stringify(snap), ts, 'published', actor.user, ts, ts, ts, id)
   const version = archiveVersion({ id }, 'publish', note, actor)
   run('UPDATE crisis_reports SET published_version=? WHERE id=?', version, id)
-  // 回写最近一次结案档案（报告状态进入统计口径；该危机后续重开结案时此标记随档案回滚撤销）
-  const closure = q1('SELECT * FROM crisis_closures WHERE crisis_id=? ORDER BY id DESC LIMIT 1', r.crisis_id)
+  // 回写最近一次「有效结案档案」（未回滚且未回写报告）：
+  //   · 新链路下结案时已冻结当次发布版本，此处不会重复改写；
+  //   · 兼容历史结案（先结案后补发布报告）与回滚后重新结案前的补发场景；
+  //   · 已回滚档案保持结案时点口径，不再被新发布动作覆盖。
+  const closure = q1('SELECT * FROM crisis_closures WHERE crisis_id=? AND rolled_back=0 AND report_id IS NULL ORDER BY id DESC LIMIT 1', r.crisis_id)
   if (closure) run('UPDATE crisis_closures SET report_id=?, report_version=?, report_title=? WHERE id=?', id, version, r.title, closure.id)
   addLog(id, 'approve', `审核通过并发布（归档 v${version}，审核人：${actor.user}）${note ? '：' + note : ''}`, actor)
   addTimeline(r.crisis_id, '复盘发布',
-    `复盘报告「${r.title}」审核通过并发布（v${version}），已回写结案档案` + (closure ? '' : '（该事件暂无结案档案，暂仅更新统计口径）'), ts)
+    `复盘报告「${r.title}」审核通过并发布（v${version}）` + (closure ? '，已回写结案档案' : '，结案档案已记录发布版本（历史回滚档案口径保留）'), ts)
   return { ok: true, version, closureId: closure ? closure.id : null }
 }
 
@@ -397,11 +403,13 @@ export function rollbackReport(id, body, actor) {
       v.snapshot || '{}', ts, 'draft', ts, id)
     const newVersion = archiveVersionInner(id, 'rollback', note || `回滚至 v${targetVersion} 的内容重新编制`, actor, targetVersion)
     if (wasPublished) {
-      // 撤销结案档案上的已发布回写（仅当仍指向本报告）
-      const closure = q1('SELECT * FROM crisis_closures WHERE crisis_id=? AND report_id=? ORDER BY id DESC LIMIT 1', r.crisis_id, id)
-      if (closure) run('UPDATE crisis_closures SET report_id=NULL, report_version=0, report_title=? WHERE id=?', '', closure.id)
+      // 有效结案档案上的回写标记同步撤销（仅未回滚档案：新结案会重新冻结发布版本，重编期间档案不再指向旧版本）；
+      // 已回滚的历史档案保留结案时点的报告版本作为历史口径，不做抹除。
+      const closure = q1('SELECT * FROM crisis_closures WHERE crisis_id=? AND rolled_back=0 AND report_id=? ORDER BY id DESC LIMIT 1', r.crisis_id, id)
+      if (closure) run("UPDATE crisis_closures SET report_id=NULL, report_version=0, report_title=? WHERE id=?", '', closure.id)
       addTimeline(r.crisis_id, '复盘回滚',
-        `复盘报告「${r.title}」已发布版本回滚至 v${targetVersion}（新归档 v${newVersion}，操作人：${actor.user}），退回编制中，结案档案回写已撤销` +
+        `复盘报告「${r.title}」已发布版本回滚至 v${targetVersion}（新归档 v${newVersion}，操作人：${actor.user}），退回编制中` +
+        (closure ? '，有效结案档案回写已撤销（历史回滚档案保留原口径）' : '，历史结案档案保留原发布口径') +
         (note ? '：' + note : ''), ts)
     } else {
       addTimeline(r.crisis_id, '复盘回滚',

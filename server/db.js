@@ -90,12 +90,14 @@ CREATE TABLE IF NOT EXISTS crisis_timeline (
   ref_type TEXT NOT NULL DEFAULT '',  -- 链路锚点：workorder/notify（空=普通处置记录）
   ref_id INTEGER                       -- 锚点对象 id（工单 id 等，看板/复盘可跳转）
 );
--- 结案档案：每次结案一行，记录联动解除的预警清单与结案前状态，支撑结案回滚精确恢复
+-- 结案档案：每次结案一行，记录统一守卫快照与联动中止/解除清单，支撑结案回滚精确恢复
 CREATE TABLE IF NOT EXISTS crisis_closures (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   crisis_id INTEGER NOT NULL,
   summary TEXT NOT NULL DEFAULT '',
   resolved_events TEXT NOT NULL DEFAULT '[]',  -- 结案联动解除的 alert_event id 列表（JSON）
+  cancelled_tasks TEXT NOT NULL DEFAULT '[]',  -- 结案联动中止的通知任务快照（JSON，含状态/回执倒计时，回滚精确恢复）
+  guard_snapshot TEXT NOT NULL DEFAULT '{}',   -- 结案时统一守卫快照（各项计数/报告版本，回溯与历史档案同源展示）
   prev_status TEXT NOT NULL DEFAULT 'disposal', -- 结案前状态（回滚恢复目标）
   closed_at TEXT NOT NULL,
   rolled_back INTEGER NOT NULL DEFAULT 0,
@@ -598,10 +600,13 @@ ensureColumn('work_orders', 'prop_path_id', 'prop_path_id INTEGER')
 // 老库迁移：传播路径表爆发时间戳列（早期 TEXT 定义以建表语句为准，这里仅补缺失列）
 ensureColumn('prop_paths', 'outbreak_at', 'outbreak_at INTEGER')
 ensureColumn('prop_paths', 'last_outbreak_wo_at', 'last_outbreak_wo_at INTEGER')
-// 复盘报告回写结案档案：已发布报告 id/版本/标题（结案档案展示统计口径同源；结案回滚时撤销回写）
+// 复盘报告回写结案档案：已发布报告 id/版本/标题（结案档案展示统计口径同源；结案回滚时保留回写作为历史口径）
 ensureColumn('crisis_closures', 'report_id', 'report_id INTEGER')
 ensureColumn('crisis_closures', 'report_version', 'report_version INTEGER NOT NULL DEFAULT 0')
 ensureColumn('crisis_closures', 'report_title', "report_title TEXT NOT NULL DEFAULT ''")
+// 结案闭环升级：统一守卫快照 + 通知回执联动中止清单（老库补齐：历史档案为空清单/空快照，回滚仅恢复状态与预警）
+ensureColumn('crisis_closures', 'cancelled_tasks', "cancelled_tasks TEXT NOT NULL DEFAULT '[]'")
+ensureColumn('crisis_closures', 'guard_snapshot', "guard_snapshot TEXT NOT NULL DEFAULT '{}'")
 // 危机声明关联（工单卡片展示最近一次声明回写的进度）
 ensureColumn('work_orders', 'last_statement_id', 'last_statement_id INTEGER')
 // ===== 协同调度链路升级：工单与通知共享可追踪状态流 =====

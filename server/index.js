@@ -20,7 +20,7 @@ import {
 } from './collect.js'
 import {
   WO_STATUS, WO_PRIORITY, WO_ROLE, WO_CATEGORY,
-  listWorkOrders, getWorkOrder, workOrderLogs, workOrderSummary, crisisOpenCount, workOrderDispatchTrace,
+  listWorkOrders, getWorkOrder, workOrderLogs, workOrderSummary, workOrderDispatchTrace,
   createWorkOrder, assignWorkOrder, claimWorkOrder, startWorkOrder,
   blockWorkOrder, completeWorkOrder, reworkWorkOrder, cancelWorkOrder,
   startWorkOrderScheduler, bindWorkOrderNotify
@@ -41,7 +41,7 @@ import {
 } from './reports.js'
 import {
   STMT_STATUS, STMT_PRIORITY, STMT_CHANNELS, CH_STATUS,
-  listStatements, getStatement, statementSummary, crisisStatementBrief, crisisOpenStatementCount,
+  listStatements, getStatement, statementSummary, crisisStatementBrief,
   createStatement, editStatement, submitStatement, approveStatement, rejectStatement,
   startPublishing, registerChannel, retryChannel, cancelChannel, cancelStatement,
   deleteStatementsOfCrisis
@@ -55,6 +55,7 @@ import {
   receiveSubmission, acceptSubmission, rejectSubmission, bindSubmissionCrisis,
   detachSubmissionsOfCrisis
 } from './portal.js'
+import { closureReadiness, closeCrisis, reopenCrisis } from './closures.js'
 
 const app = express()
 app.use(express.json({ limit: '5mb' })) // 大批量导入（上限 5000 条）
@@ -478,13 +479,23 @@ app.get('/api/crisis/:id/review', (req, res) => {
       (SELECT COUNT(*) FROM alert_events ae WHERE ae.crisis_id=ca.crisis_id AND ae.alert_id=ca.alert_id AND ae.status='open') open
     FROM crisis_alerts ca LEFT JOIN alerts al ON al.id=ca.alert_id
     WHERE ca.crisis_id=? ORDER BY ca.is_origin DESC, ca.alert_id`, c.id)
-  // 结案档案（含已回滚）：回溯面板展示结案/回滚历史
-  const closures = q('SELECT * FROM crisis_closures WHERE crisis_id=? ORDER BY id DESC', c.id)
+  // 结案档案（含已回滚）：回溯面板展示结案/回滚历史（统一守卫快照/中止清单随档案返回）
+  const closures = q('SELECT * FROM crisis_closures WHERE crisis_id=? ORDER BY id DESC', c.id).map((cl) => {
+    const parseJson = (s, dft) => { try { const v = JSON.parse(s || ''); return v ?? dft } catch { return dft } }
+    return {
+      ...cl,
+      resolved_events: parseJson(cl.resolved_events, []),
+      cancelled_tasks: parseJson(cl.cancelled_tasks, []),
+      guard_snapshot: parseJson(cl.guard_snapshot, null)
+    }
+  })
   // 复盘报告回写状态（统计口径同源：已发布版本回写结案档案）
   const reportRow = q1('SELECT id,title,status,current_version,published_version,reviewed_by,published_at FROM crisis_reports WHERE crisis_id=? ORDER BY id DESC LIMIT 1', c.id)
   const report = reportRow ? { ...reportRow, statusText: REPORT_STATUS[reportRow.status] || reportRow.status } : null
+  // 统一结案守卫：未结案时返回阻断项/级联项清单（与结案接口同一口径，前端渲染结案检查清单）
+  const readiness = c.status === 'closed' ? null : closureReadiness(c.id)
   res.json({
-    crisis: c, timeline, events, rules, closures, report,
+    crisis: c, timeline, events, rules, closures, report, readiness,
     stats: {
       triggers: events.length,
       open,
@@ -497,85 +508,40 @@ app.get('/api/crisis/:id/review', (req, res) => {
   })
 })
 
-// 结案：事务化写入结案档案 + 级联解除关联的未解除预警，完成闭环（重复结案幂等）
-// 守卫：存在未完结协同工单时禁止结案（跨角色协同未闭环），需先完成/取消工单
+// 结案：统一状态守卫 + 事务化结案档案（守卫快照）+ 级联解除预警 + 联动中止在途通知（重复结案幂等）
+// 守卫（closures.closureReadiness 同源）：未完结协同工单 / 未完结危机声明 / 待审核外部协作提交 / 复盘报告未发布 阻断；
+// 未解除预警与在途通知不阻断——结案时分别级联解除与联动中止，均冻结进档案并可随回滚精确恢复。
 app.post('/api/crisis/:id/close', (req, res) => {
   const c = q1('SELECT * FROM crisis WHERE id=?', req.params.id)
   if (!c) return res.status(404).json({ error: 'not found' })
-  if (c.status === 'closed') return res.json({ ok: true, already: true })
-  const openWo = crisisOpenCount(c.id)
-  if (openWo > 0) return res.status(400).json({ error: `存在 ${openWo} 个未完结协同工单，请先完成或取消工单后再结案` })
-  const openStmt = crisisOpenStatementCount(c.id)
-  if (openStmt > 0) return res.status(400).json({ error: `存在 ${openStmt} 份未完结危机声明（起草/待审/发布中/部分渠道失败），请先完成全部渠道发布（失败渠道重试成功或放弃）或取消声明后再结案` })
-  const summary = (req.body.summary || '').trim() || '预警解除，舆情回落，完成处置闭环。'
-  const ts = now()
-  const opens = q("SELECT * FROM alert_events WHERE crisis_id=? AND status='open'", c.id)
-  let closureId = null
-  db.exec('BEGIN')
+  let result
   try {
-    for (const ev of opens) run("UPDATE alert_events SET status='resolved', resolved=?, resolve_kind='close' WHERE id=? AND status='open'", ts, ev.id)
-    // 结案档案：记录联动解除清单与结案前状态，供结案回滚精确恢复
-    const cr = run('INSERT INTO crisis_closures (crisis_id,summary,resolved_events,prev_status,closed_at) VALUES (?,?,?,?,?)',
-      c.id, summary, JSON.stringify(opens.map((e) => e.id)), c.status, ts)
-    closureId = Number(cr.lastInsertRowid)
-    run("UPDATE crisis SET status='closed' WHERE id=?", c.id)
-    // 结案级联解除可能横跨多条规则，记录涉及的规则名
-    const auto = opens.length
-      ? `（同步解除 ${opens.length} 条未解除预警：${[...new Set(opens.map((e) => e.alert_id))].map((rid) => {
-          const al = q1('SELECT title FROM alerts WHERE id=?', rid); return al ? `「${al.title}」` : '已删除规则'
-        }).join('、')}）`
-      : ''
-    addTimeline(c.id, '事件结案', summary + auto, ts)
-    db.exec('COMMIT')
+    result = closeCrisis(c.id, req.body.summary)
   } catch (e) {
-    try { db.exec('ROLLBACK') } catch { /* 已回滚 */ }
     return res.status(500).json({ error: String(e.message || e) })
   }
-  generateForCrisisStatus(c.id, 'closed') // 通知编排：结案通报
-  res.json({ ok: true, resolved: opens.length, closureId })
+  if (result.error) {
+    if (result.error === 'not found') return res.status(404).json({ error: 'not found' })
+    return res.status(400).json({ error: result.error, readiness: result.readiness || null })
+  }
+  if (result.already) return res.json({ ok: true, already: true })
+  generateForCrisisStatus(c.id, 'closed') // 通知编排：结案通报（在在途任务中止之后生成，不会被误中止）
+  res.json({ ok: true, resolved: result.resolved, cancelled: result.cancelled, closureId: result.closureId })
 })
 
-// 结案回滚：恢复最近一次未回滚结案联动解除的预警为未解除，事件重回结案前状态
+// 结案回滚：按最近一次结案档案恢复预警与被中止通知任务（含回执倒计时），事件重回结案前状态
 app.post('/api/crisis/:id/reopen', (req, res) => {
   const c = q1('SELECT * FROM crisis WHERE id=?', req.params.id)
   if (!c) return res.status(404).json({ error: 'not found' })
-  if (c.status !== 'closed') return res.json({ ok: true, already: true, status: c.status })
-  const closure = q1('SELECT * FROM crisis_closures WHERE crisis_id=? AND rolled_back=0 ORDER BY id DESC LIMIT 1', c.id)
-  const note = (req.body.note || '').trim()
-  const ts = now()
-  const ST = { monitoring: '监测中', disposal: '处置中' }
-  const backTo = closure && closure.prev_status && closure.prev_status !== 'closed' ? closure.prev_status : 'disposal'
-  let restored = 0
-  db.exec('BEGIN')
+  let result
   try {
-    if (closure) {
-      let ids = []
-      try { ids = JSON.parse(closure.resolved_events || '[]') } catch { ids = [] }
-      for (const id of ids) {
-        // 状态守卫：仅恢复仍处解除态的记录（重复回滚/已被其他链路处理时幂等）
-        const r = run("UPDATE alert_events SET status='open', resolved=NULL, resolve_kind='' WHERE id=? AND status='resolved'", id)
-        restored += Number(r.changes || 0)
-      }
-      run('UPDATE crisis_closures SET rolled_back=1, rolled_back_at=?, rollback_note=? WHERE id=?', ts, note, closure.id)
-      // 复盘报告回写随结案档案回滚一并撤销（已发布报告回到编制中，由报告模块独立管理）
-      if (closure.report_id) {
-        const rep = q1('SELECT status,title FROM crisis_reports WHERE id=?', closure.report_id)
-        run("UPDATE crisis_closures SET report_id=NULL, report_version=0, report_title='' WHERE id=?", closure.id)
-        if (rep) addTimeline(c.id, '复盘回滚', `结案档案回滚：已发布复盘报告「${rep.title}」的结案回写已撤销，报告保留可在复盘报告页查阅或回滚重编`, ts)
-      }
-    }
-    run('UPDATE crisis SET status=? WHERE id=?', backTo, c.id)
-    addTimeline(c.id, '结案回滚',
-      `结案回滚：事件重回「${ST[backTo] || backTo}」` +
-      (closure ? `，恢复 ${restored} 条结案联动解除的预警为未解除` : '（历史结案无回滚档案，仅恢复状态）') +
-      (note ? ` · ${note}` : ''), ts)
-    db.exec('COMMIT')
+    result = reopenCrisis(c.id, req.body.note)
   } catch (e) {
-    try { db.exec('ROLLBACK') } catch { /* 已回滚 */ }
     return res.status(500).json({ error: String(e.message || e) })
   }
-  generateForCrisisStatus(c.id, backTo) // 通知编排：结案回滚后的状态流转
-  res.json({ ok: true, restored, status: backTo })
+  if (result.already) return res.json({ ok: true, already: true, status: result.status })
+  generateForCrisisStatus(c.id, result.status) // 通知编排：回滚后的状态流转
+  res.json({ ok: true, restored: result.restored, restoredTasks: result.restoredTasks, status: result.status })
 })
 app.delete('/api/crisis/:id', (req, res) => {
   const cid = +req.params.id

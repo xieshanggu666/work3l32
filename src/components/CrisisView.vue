@@ -2,7 +2,7 @@
   <div class="crisis">
     <div class="toolbar">
       <button class="add" @click="showForm=!showForm">＋ 新建危机事件</button>
-      <span class="loop-hint">🔗 红/橙预警按「话题 + 时间窗口」归并：多规则并发触发可承接同一事件并上调级别；解除幂等、结案可回滚；可拆分跨角色协同工单，结案须先完结全部工单</span>
+      <span class="loop-hint">🔗 红/橙预警按「话题 + 时间窗口」归并；结案统一守卫（工单/声明/外部协作/复盘报告全部闭环）→ 级联解除预警、联动中止在途通知并冻结结案档案，回滚可精确恢复；兼容历史结案档案</span>
     </div>
 
     <form v-if="showForm" class="c-form" @submit.prevent="create">
@@ -119,13 +119,20 @@
           </div>
           <div v-else class="rv-none">无关联预警触发记录（人工建档）</div>
 
-          <!-- 结案档案：结案/回滚历史（统一时间线口径） -->
+          <!-- 结案档案：结案/回滚历史（统一守卫快照口径） -->
           <div v-if="review.closures && review.closures.length" class="rv-closures">
             <div v-for="cl in review.closures" :key="cl.id" class="rv-closure" :class="{rolled: cl.rolled_back}">
               <b>{{ cl.rolled_back ? '↩︎ 结案已回滚' : '✔ 结案' }}</b>
               <span class="cl-sum">{{ cl.summary || '（无总结）' }}</span>
-              <span v-if="cl.report_id || (review.report && review.report.published_version)" class="cl-report">
-                📝 复盘报告已回写：{{ cl.report_title || review.report?.title }}（v{{ cl.report_version || review.report?.published_version }}）
+              <span v-if="cl.report_id || (review.report && review.report.published_version && !cl.rolled_back)" class="cl-report">
+                📝 复盘报告：{{ cl.report_title || review.report?.title }}（v{{ cl.report_version || review.report?.published_version }}）
+              </span>
+              <span v-if="closureGuard(cl)" class="cl-guard">
+                🛡 结案守卫：工单 {{ closureGuard(cl).workOrders.open }} 在办 · 声明 {{ closureGuard(cl).statements.open }} 在办
+                · 外部提交 {{ closureGuard(cl).submissions.open }} 待审 · 报告{{ closureGuard(cl).report ? ' 已发布 v' + closureGuard(cl).report.version : '—' }}
+              </span>
+              <span v-if="closureCascade(cl)" class="cl-cascade">
+                🔗 联动：解除预警 {{ closureCascade(cl).alerts }} 条 · 中止通知 {{ closureCascade(cl).tasks }} 条<template v-if="cl.rolled_back">（回滚已恢复）</template>
               </span>
               <em>{{ cl.closed_at }}<template v-if="cl.rolled_back"> · 回滚于 {{ cl.rolled_back_at }}{{ cl.rollback_note ? '：' + cl.rollback_note : '' }}</template></em>
             </div>
@@ -138,14 +145,49 @@
             <button class="mini-link" @click="gotoReport(c)">前往报告 →</button>
           </div>
 
+          <!-- 统一结案守卫：阻断项必须全部清零；预警/通知为级联项，结案时自动处理并留档可回滚 -->
+          <div v-if="c.status!=='closed' && review.readiness" class="guard-box" :class="{ready: review.readiness.ready}">
+            <h6>{{ review.readiness.ready ? '🛡 结案守卫已通过，可以结案' : '🛡 结案守卫检查' }}</h6>
+            <ul class="guard-list">
+              <li :class="{ok: !guardCount('workorder'), bad: guardCount('workorder')}">
+                <i>{{ guardCount('workorder') ? '✕' : '✔' }}</i>协同工单全部完结
+                <b v-if="guardCount('workorder')">{{ guardCount('workorder') }} 个在办</b>
+                <button v-if="guardCount('workorder')" class="mini-link" @click="gotoWorkOrder(c)">去处理 →</button>
+              </li>
+              <li :class="{ok: !guardCount('statement'), bad: guardCount('statement')}">
+                <i>{{ guardCount('statement') ? '✕' : '✔' }}</i>危机声明全部发布/取消
+                <b v-if="guardCount('statement')">{{ guardCount('statement') }} 份未完结</b>
+                <button v-if="guardCount('statement')" class="mini-link" @click="gotoStmt(c)">去处理 →</button>
+              </li>
+              <li :class="{ok: !guardCount('external'), bad: guardCount('external')}">
+                <i>{{ guardCount('external') ? '✕' : '✔' }}</i>外部协作提交全部办结
+                <b v-if="guardCount('external')">{{ guardCount('external') }} 条待审核</b>
+                <button v-if="guardCount('external')" class="mini-link" @click="gotoExt(c)">去审核 →</button>
+              </li>
+              <li :class="{ok: reportPublished, bad: !reportPublished}">
+                <i>{{ reportPublished ? '✔' : '✕' }}</i>复盘报告已审核发布
+                <b v-if="!reportPublished">{{ review.readiness.report ? review.readiness.report.statusText : '尚未建档' }}</b>
+                <button class="mini-link" @click="gotoReport(c)">{{ review.readiness.report ? '前往报告 →' : '去编制 →' }}</button>
+              </li>
+              <li class="cascade-item">
+                <i>⇢</i>未解除预警将随结案级联解除<b>{{ review.readiness.cascades.alerts }} 条</b>（回滚可恢复）
+              </li>
+              <li class="cascade-item">
+                <i>⇢</i>在途通知将随结案联动中止<b>{{ review.readiness.cascades.tasks }} 条</b>（待回执不再催办，回滚可恢复）
+              </li>
+            </ul>
+          </div>
+
           <div v-if="c.status!=='closed'" class="close-box">
             <textarea v-model="closeSummary" placeholder="结案回溯总结：处置结果、舆情回落情况、经验沉淀…"></textarea>
             <div class="close-row">
               <span v-if="review.stats.open" class="cascade">结案将同步解除 {{ review.stats.open }} 条未解除预警</span>
-              <button class="close" @click="confirmClose(c)">✔ 确认结案</button>
+              <button class="close" :disabled="review.readiness && !review.readiness.ready" @click="confirmClose(c)">
+                {{ review.readiness && !review.readiness.ready ? '守卫未通过，不可结案' : '✔ 确认结案' }}
+              </button>
             </div>
           </div>
-          <div v-else class="closed-tip">✅ 已结案 · 回溯只读</div>
+          <div v-else class="closed-tip">✅ 已结案 · 回溯只读 · 可回滚恢复预警与通知任务</div>
         </div>
 
         <div class="actions">
@@ -241,12 +283,31 @@ function openTimelineExt(t) {
   store.tab = 'ext'
 }
 async function reopen(c) {
-  const note = prompt(`回滚结案「${c.title}」：结案时联动解除的预警将恢复为未解除，事件重回处置流程。\n回滚说明（可留空）：`)
+  const note = prompt(`回滚结案「${c.title}」：结案时联动解除的预警、中止的在途通知任务将精确恢复，事件重回处置流程。\n回滚说明（可留空）：`)
   if (note == null) return
   await store.reopenCrisis(c.id, note)
   if (reviewId.value === c.id) review.value = await store.fetchCrisisReview(c.id) // 刷新回溯（结案档案/未解除计数）
 }
-function kindText(k) { return { manual: '手动解除', batch: '批量解除', close: '结案联动', notify: '通知回执', workorder: '工单联动' }[k] || k }
+function kindText(k) { return { manual: '手动解除', batch: '批量解除', close: '结案联动', notify: '通知回执', workorder: '工单联动', portal: '外部协作采纳' }[k] || k }
+// 统一结案守卫：读取各阻断项计数（与后端 closureReadiness 同口径）
+function guardCount(key) {
+  const rd = review.value?.readiness
+  if (!rd) return 0
+  return { workorder: rd.workOrders.length, statement: rd.statements.length, external: rd.submissions.length }[key] || 0
+}
+const reportPublished = computed(() => review.value?.readiness?.report?.status === 'published')
+// 历史结案档案的守卫快照（新链路档案有冻结；历史档案为空，面板按可用字段降级展示）
+function closureGuard(cl) {
+  if (cl.guard_snapshot && typeof cl.guard_snapshot === 'object') return cl.guard_snapshot
+  return null
+}
+function closureCascade(cl) {
+  const g = closureGuard(cl)
+  if (g) return { alerts: g.alerts?.resolved ?? 0, tasks: g.notifyTasks?.cancelled ?? 0 }
+  // 历史档案：仅有解除清单可统计
+  const ev = Array.isArray(cl.resolved_events) ? cl.resolved_events.length : 0
+  return ev ? { alerts: ev, tasks: 0 } : null
+}
 async function del(c) {
   if (confirm(`删除危机「${c.title}」？`)) await store.delCrisis(c.id)
 }
@@ -375,6 +436,24 @@ h5{margin:0 0 8px;color:#ffd54f;font-size:12px;}
 .rv-closure .cl-sum{color:#8ba2c8;font-size:10px;}
 .cl-report{font-size:10px;color:#ce93d8;background:#1d1440;border:1px solid rgba(149,117,205,.35);border-radius:5px;padding:2px 8px;align-self:flex-start;}
 .rv-closure em{color:#5b6f94;font-size:10px;font-style:normal;}
+.cl-guard{font-size:10px;color:#80cbc4;background:#0a2320;border:1px solid rgba(38,166,154,.3);border-radius:5px;padding:2px 8px;align-self:flex-start;}
+.cl-cascade{font-size:10px;color:#90caf9;background:#0d2137;border:1px solid rgba(144,202,249,.25);border-radius:5px;padding:2px 8px;align-self:flex-start;}
+.guard-box{background:#1a1420;border:1px solid rgba(239,83,80,.35);border-radius:8px;padding:9px 11px;margin-bottom:10px;}
+.guard-box.ready{background:#0f2017;border-color:rgba(102,187,106,.4);}
+.guard-box h6{margin:0 0 7px;font-size:11px;color:#ef9a9a;}
+.guard-box.ready h6{color:#a5d6a7;}
+.guard-list{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:4px;}
+.guard-list li{font-size:11px;color:#dbe4f3;display:flex;align-items:center;gap:7px;flex-wrap:wrap;}
+.guard-list li i{width:15px;height:15px;border-radius:50%;display:grid;place-items:center;font-style:normal;font-size:9px;flex:none;}
+.guard-list li.ok i{background:#1b5e20;color:#a5d6a7;}
+.guard-list li.bad i{background:#b71c1c;color:#ffcdd2;}
+.guard-list li.cascade-item{color:#8ba2c8;}
+.guard-list li.cascade-item i{background:#26344e;color:#90caf9;}
+.guard-list li b{color:#ef9a9a;font-size:10px;font-weight:600;}
+.guard-list li.cascade-item b{color:#90caf9;}
+.guard-list .mini-link{padding:0 2px;}
+.close .disabled,
+button.close:disabled{opacity:.55;cursor:not-allowed;background:linear-gradient(135deg,#546e7a,#37474f);}
 .rv-report{display:flex;align-items:center;gap:8px;font-size:11px;color:#dbe4f3;background:#13233f;border-radius:7px;padding:7px 11px;margin-bottom:10px;border-left:3px solid #7e57c2;flex-wrap:wrap;}
 .rv-report.published{border-left-color:#66bb6a;}.rv-report.reviewing{border-left-color:#ffa726;}
 .mini-link{margin-left:auto;background:none;border:none;color:#90caf9;font-size:11px;cursor:pointer;text-decoration:underline;}

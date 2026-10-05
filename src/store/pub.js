@@ -108,14 +108,16 @@ export const usePubStore = defineStore('pub', {
       const r = await api(`/crisis/${id}/close`, 'POST', { summary })
       await this.load()
       if (r.already) this.msg('事件已处于结案状态', 'info')
-      else this.msg(r.resolved ? `事件已结案，同步解除 ${r.resolved} 条预警` : '事件已结案', 'success')
+      else this.msg(`事件已结案` +
+        [r.resolved ? `，同步解除 ${r.resolved} 条预警` : '', r.cancelled ? `，中止 ${r.cancelled} 条在途通知` : ''].join(''), 'success')
       return r
     },
     async reopenCrisis(id, note) {
       const r = await api(`/crisis/${id}/reopen`, 'POST', { note })
       await this.load()
       if (r.already) this.msg('事件未在结案状态，无需回滚', 'info')
-      else this.msg(r.restored ? `已回滚结案，恢复 ${r.restored} 条未解除预警` : '已回滚结案，事件重新打开', 'success')
+      else this.msg(`已回滚结案` +
+        [r.restored ? `，恢复 ${r.restored} 条未解除预警` : '', r.restoredTasks ? `，恢复 ${r.restoredTasks} 条通知任务` : ''].join(''), 'success')
       return r
     },
     async delCrisis(id) { await api('/crisis/' + id, 'DELETE'); await this.load() },
